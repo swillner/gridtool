@@ -51,11 +51,15 @@ static MinMax<U> aggregate(
     netCDF::NcVar var, std::size_t latdiv, std::size_t londiv, nvector::Vector<U, 2>& outgrid, std::size_t max_memusage, std::size_t time) {
     MinMax<U> minmax = {std::numeric_limits<U>::max(), std::numeric_limits<U>::lowest()};
     bool fill_mode;
-    T fill_value;
+    T fill_value = std::numeric_limits<T>::quiet_NaN();
     var.getFillModeParameters(fill_mode, &fill_value);
     size_t first_dim = 0;
     if (var.getDimCount() == 3) {
         first_dim = 1;
+    }
+    const auto att = var.getAtt("_FillValue");
+    if (!att.isNull()) {
+        att.getValues(&fill_value);
     }
     const auto lat_count = var.getDim(first_dim).getSize();
     const auto lon_count = var.getDim(first_dim + 1).getSize();
