@@ -24,6 +24,7 @@
 #include <iostream>
 #include <stdexcept>
 #include "Aggregation.h"
+#include "GeoGrid.h"
 #include "colormaps.h"
 #include "netcdftools.h"
 #include "nvector.h"
@@ -36,6 +37,75 @@
 using namespace cimg_library;
 
 // TODO Cleanup asserts
+
+namespace netCDF {
+
+template<typename T>
+struct NetCDFType {};
+template<>
+struct NetCDFType<double> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_DOUBLE;
+};
+template<>
+struct NetCDFType<float> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_FLOAT;
+};
+template<>
+struct NetCDFType<std::int16_t> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_USHORT;
+};
+template<>
+struct NetCDFType<int> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_INT;
+};
+template<>
+struct NetCDFType<const char*> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_STRING;
+};
+template<>
+struct NetCDFType<std::string> {
+    static const netCDF::NcType::ncType type = netCDF::NcType::nc_STRING;
+};
+
+}  // namespace netCDF
+
+static netCDF::NcFile netcdf_read(const std::string& filename) {
+    netCDF::check_file_exists(filename);
+    return netCDF::NcFile(filename, netCDF::NcFile::read);
+}
+
+template<typename T>
+class DimVar : public std::vector<T> {
+  protected:
+    const std::string name_m;
+    std::vector<std::tuple<std::string, netCDF::NcType, std::size_t, std::vector<char>>> attributes;
+
+  public:
+    using std::vector<T>::size;
+
+    DimVar(const netCDF::NcDim& dim, const netCDF::NcVar& var) : name_m(dim.getName()), std::vector<T>(dim.getSize()) {
+        var.getVar(&(*this)[0]);
+        for (const auto& att : var.getAtts()) {
+            std::size_t size = att.second.getAttLength();
+            std::vector<char> value(size);
+            att.second.getValues(&value[0]);
+            attributes.emplace_back(std::make_tuple(att.first, att.second.getType(), size, value));
+        }
+    }
+    DimVar(const netCDF::NcFile& file, const std::string& name) : DimVar(file.getDim(name), file.getVar(name)) {}
+    DimVar(const DimVar&) = delete;
+    // DimVar(DimVar&&) = default;  // NOLINT(performance-noexcept-move-constructor,hicpp-noexcept-move) [cannot use noexpect here]
+    netCDF::NcDim write_to(netCDF::NcFile& file) const {
+        netCDF::NcDim result = file.addDim(name_m, size());
+        netCDF::NcVar var = file.addVar(name_m, netCDF::NetCDFType<T>::type, {result});
+        for (const auto& att : attributes) {
+            var.putAtt(std::get<0>(att), std::get<1>(att), std::get<2>(att), &std::get<3>(att)[0]);
+        }
+        var.putVar(&(*this)[0]);
+        return result;
+    }
+    const std::string& name() const { return name_m; }
+};
 
 static std::tuple<netCDF::NcVar, std::string, std::size_t, std::size_t> get_grid_var(netCDF::NcFile& file, std::string varname_p) {
     netCDF::NcVar var;
@@ -71,9 +141,7 @@ args::HelpFlag help(arguments, "help", "Print this help text", {'h', "help"});
 args::Flag version(arguments, "version", "Print version", {'v', "version"});
 
 int main(int argc, const char** argv) {
-#ifndef DEBUG
     try {
-#endif
         args::ArgumentParser p(
             "gridtool"
             "\n\n"
@@ -322,6 +390,114 @@ int main(int argc, const char** argv) {
             std::cout << "Total: " << aggregation.total(var) << std::endl;
         });
 
+        args::Command affected_population_cmd(commands, "affected_population", "calculate affected population", [&](args::Subparser& parser) {
+            args::ValueFlag<std::size_t> chunk_size_p(parser, "chunk_size", "Number of time steps to read at once [default: 10]", {"chunk-size"}, 10);
+            args::Positional<std::string> population_filename_p(parser, "population_filename", "Population file");
+            args::Positional<std::string> fraction_filename_p(parser, "fraction_filename", "Fraction file");
+            args::Positional<std::string> iso_raster_filename_p(parser, "iso_raster_filename", "ISO raster file");
+            args::Positional<std::string> outfilename_p(parser, "output_filename", "Output file");
+            parser.Parse();
+
+            const auto chunk_size = chunk_size_p.Get();
+            const auto population_file = netcdf_read(population_filename_p.Get());
+            const auto fraction_file = netcdf_read(fraction_filename_p.Get());
+            const auto iso_raster_file = netcdf_read(iso_raster_filename_p.Get());
+            netCDF::NcFile outfile(outfilename_p.Get(), netCDF::NcFile::replace, netCDF::NcFile::nc4);
+
+            GeoGrid<double> population_grid;
+            population_grid.read_from_netcdf(population_file, population_filename_p.Get());
+            GeoGrid<double> fraction_grid;
+            fraction_grid.read_from_netcdf(fraction_file, fraction_filename_p.Get());
+            GeoGrid<double> iso_raster_grid;
+            iso_raster_grid.read_from_netcdf(iso_raster_file, iso_raster_filename_p.Get());
+            GeoGrid<double> common_grid;
+
+            const auto population_var = population_file.getVar("population");
+            const auto fraction_var = fraction_file.getVar("fldfrc");
+            const auto iso_raster_var = iso_raster_file.getVar("iso");
+
+            const auto population_time_count = population_var.getDim(0).getSize();
+            const auto fraction_time_count = fraction_var.getDim(0).getSize();
+            const auto time_count = std::min(population_time_count, fraction_time_count);
+            assert(fraction_time_count <= population_time_count);
+            DimVar<double> fraction_time(fraction_file, "time");
+
+            nvector::Vector<float, 2> iso_raster_values(-1, iso_raster_grid.lat_count, iso_raster_grid.lon_count);
+            iso_raster_var.getVar({0, 0}, {iso_raster_grid.lat_count, iso_raster_grid.lon_count}, &iso_raster_values.data()[0]);
+            DimVar<const char*> iso_raster_index(iso_raster_file, "index");
+            const auto region_count = iso_raster_index.size();
+
+            nvector::Vector<double, 2> affected_population(0, time_count, region_count);
+            nvector::Vector<double, 2> rel_affected_population(0, time_count, region_count);
+            nvector::Vector<double, 2> total_population(0, time_count, region_count);
+
+            std::size_t chunk_pos = chunk_size;
+            std::vector<float> population_buffer(chunk_size * population_grid.size());
+            std::vector<float> fraction_buffer(chunk_size * fraction_grid.size());
+
+            progressbar::ProgressBar time_bar(time_count, "Time steps", true);
+            for (std::size_t t = 0; t < time_count; ++t) {
+                if (chunk_pos == chunk_size) {
+                    population_var.getVar({t, 0, 0}, {std::min(chunk_size, time_count - t), population_grid.lat_count, population_grid.lon_count},
+                                          &population_buffer[0]);
+                    fraction_var.getVar({t, 0, 0}, {std::min(chunk_size, time_count - t), fraction_grid.lat_count, fraction_grid.lon_count},
+                                        &fraction_buffer[0]);
+                    chunk_pos = 0;
+                    time_bar.reset_eta();
+                }
+                nvector::View<float, 2> population_values(std::begin(population_buffer) + chunk_pos * population_grid.size(), population_grid.lat_count,
+                                                          population_grid.lon_count);
+                nvector::View<float, 2> fraction_values(std::begin(fraction_buffer) + chunk_pos * fraction_grid.size(), fraction_grid.lat_count,
+                                                        fraction_grid.lon_count);
+                ++chunk_pos;
+
+                nvector::foreach_view(common_grid_view(common_grid, GridView{iso_raster_values, iso_raster_grid}, GridView{population_values, population_grid},
+                                                       GridView{fraction_values, fraction_grid}),
+                                      [&](long /* lat */, long /* lon */, float i, float p, float f) {
+                                          if (f > 1e10 || p <= 0 || i < 0 || std::isnan(i) || std::isnan(f) || std::isnan(p)) {
+                                              return true;
+                                          }
+                                          affected_population(t, static_cast<int>(i)) += f * p;
+                                          return true;
+                                      });
+
+                nvector::foreach_view(common_grid_view(common_grid, GridView{iso_raster_values, iso_raster_grid}, GridView{population_values, population_grid}),
+                                      [&](long /* lat */, long /* lon */, float i, float p) {
+                                          if (p <= 0 || i < 0 || std::isnan(i) || std::isnan(p)) {
+                                              return true;
+                                          }
+                                          total_population(t, static_cast<int>(i)) += p;
+                                          return true;
+                                      });
+
+                nvector::foreach_view(nvector::collect(affected_population.split<false, true>()(t), total_population.split<false, true>()(t),
+                                                       rel_affected_population.split<false, true>()(t)),
+                                      [](long /* i */, double a, double t, double& r) {
+                                          r = a / t;
+                                          return true;
+                                      });
+
+                ++time_bar;
+            }
+
+            auto index_dim = iso_raster_index.write_to(outfile);
+            auto time_dim = fraction_time.write_to(outfile);
+
+            netCDF::NcVar outvar;
+
+            outvar = outfile.addVar("affected_population", netCDF::NcType::nc_DOUBLE, {time_dim, index_dim});
+            outvar.setCompression(false, true, 7);
+            outvar.putVar(&affected_population.data()[0]);
+
+            outvar = outfile.addVar("total_population", netCDF::NcType::nc_DOUBLE, {time_dim, index_dim});
+            outvar.setCompression(false, true, 7);
+            outvar.putVar(&total_population.data()[0]);
+
+            outvar = outfile.addVar("rel_affected_population", netCDF::NcType::nc_DOUBLE, {time_dim, index_dim});
+            outvar.setCompression(false, true, 7);
+            outvar.putVar(&rel_affected_population.data()[0]);
+        });
+
         args::GlobalOptions globals(p, arguments);
 
         try {
@@ -338,10 +514,8 @@ int main(int argc, const char** argv) {
         }
 
         return 0;
-#ifndef DEBUG
     } catch (std::exception& ex) {
         std::cerr << ex.what() << std::endl;
         return 255;
     }
-#endif
 }
