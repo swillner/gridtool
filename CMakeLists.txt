@@ -27,8 +27,23 @@ project(gridtool)
 
 file(GLOB SOURCES src/*.cpp)
 add_executable(gridtool ${SOURCES})
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  target_compile_options(gridtool PUBLIC -fno-math-errno -fno-rtti)
+  add_custom_command(
+    TARGET gridtool
+    POST_BUILD
+    COMMAND ${CMAKE_STRIP} gridtool
+  )
+endif()
+
 target_include_directories(gridtool PRIVATE include lib/args lib/cpp-library lib/nvector)
-set_property(TARGET gridtool PROPERTY CXX_STANDARD 14)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Intel"
+)# icc 19 does not yet fully support c++17, but we only need features it does support
+  target_compile_options(gridtool PUBLIC -std=c++17)
+else()
+  target_compile_features(gridtool PUBLIC cxx_std_17)
+endif()
 
 add_system_paths()
 set_advanced_options()
