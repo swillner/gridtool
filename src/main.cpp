@@ -18,11 +18,20 @@
 */
 
 #include <CImg.h>
+// clang-format off
+#include <glad/glad.h> // needs to come before glfw
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+// clang-format on
+
 #include <cassert>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
+
 #include "Aggregation.h"
 #include "GeoGrid.h"
 #include "colormaps.h"
@@ -496,6 +505,278 @@ int main(int argc, const char** argv) {
             outvar = outfile.addVar("rel_affected_population", netCDF::NcType::nc_DOUBLE, {time_dim, index_dim});
             outvar.setCompression(false, true, 7);
             outvar.putVar(&rel_affected_population.data()[0]);
+        });
+
+        args::Command unstructured_cmd(commands, "viewus", "view unstructured grid", [&](args::Subparser& parser) {
+            args::ValueFlag<std::size_t> width_p(parser, "width", "Maximum window width [default: 1000]", {"width"}, 1000);
+            args::ValueFlag<std::size_t> height_p(parser, "height", "Maximum window height [default: 1000]", {"height"}, 1000);
+            args::ValueFlag<std::size_t> time_p(parser, "time", "Time step to view [default: 0]", {"time"}, 0);
+            args::ValueFlag<std::string> varname_p(parser, "variable", "Variable to plot", {"variable"});
+            args::Positional<std::string> filename_p(parser, "filename", "File to view");
+            parser.Parse();
+
+            const char* vertexShaderSource = R"src(
+#version 330 core
+layout (location = 0) in vec2 p;
+layout (location = 1) in float d;
+
+flat out float normed_value;
+
+float r = 0.8f;
+uniform vec2 minmax;
+uniform mat4 transf;
+
+void main() {
+    gl_Position = transf * vec4(
+        r * cos(p.x) * cos(p.y),
+        r * sin(p.x),
+        r * cos(p.x) * sin(p.y),
+        1.0f
+    );
+    normed_value = (d - minmax.x) / (minmax.y - minmax.x);
+}
+)src";
+            const char* fragmentShaderSource = R"src(
+#version 330 core
+flat in float normed_value;
+uniform vec3 cmap[256];
+out vec4 col;
+void main() {
+    if (normed_value < 0) {
+        col = vec4(0.2f, 0.2f, 0.2f, 1.0f);
+    } else {
+        col = vec4(cmap[int(255 * normed_value)], 1.0f);
+    }
+}
+)src";
+
+            const auto filename = filename_p.Get();
+            if (filename.empty()) {
+                throw args::Error("Filename required");
+            }
+
+            const auto width = width_p.Get();
+            const auto height = height_p.Get();
+            const auto time = time_p.Get();
+            const auto varname = varname_p.Get();
+
+            netCDF::check_file_exists(filename);
+            netCDF::NcFile infile(filename, netCDF::NcFile::read);
+
+            const auto var = infile.getVar(varname);
+            const auto ncells = infile.getDim("ncells").getSize();
+            const auto ntime = infile.getDim("time").getSize();
+
+            float fill_value = std::numeric_limits<float>::quiet_NaN();
+            {
+                bool fill_mode;
+                var.getFillModeParameters(fill_mode, &fill_value);
+                const auto atts = var.getAtts();
+                const auto att = atts.find("_FillValue");
+                if (att != std::end(atts)) {
+                    att->second.getValues(&fill_value);
+                }
+            }
+
+            std::vector<float> data(3 * ncells * ntime, 0);
+            //var.getVar({0, 0, 0}, {ntime, 1, ncells}, {1, 1, 1}, {3 * ncells, 3, 3}, &data[2]);
+
+            auto dmin = std::numeric_limits<float>::max();
+            auto dmax = std::numeric_limits<float>::lowest();
+
+            for (int i = 0; i < 3; ++i) {
+                unsigned long t;
+                switch (i) {
+                    case 0:
+                        t = ntime - 1;
+                        break;
+                    case 1:
+                        t = ntime / 2;
+                        break;
+                    case 2:
+                        t = 0;
+                        break;
+                }
+                var.getVar({t, 0, 0}, {1, 1, ncells}, {1, 1, 1}, {1, 1, 3}, &data[2]);
+#pragma omp parallel for reduction(min : dmin) reduction(max : dmax)
+                for (long i = 2; i < 3 * ncells; i += 3) {
+                    const auto d = data[i];
+                    if (d != fill_value) {
+                        dmin = std::min(dmin, d);
+                        dmax = std::max(dmax, d);
+                    }
+                }
+            }
+            MinMax<float> minmax{dmin, dmax};
+            std::cout << "Min: " << minmax.min << std::endl;
+            std::cout << "Max: " << minmax.max << std::endl;
+
+            glfwInit();
+
+            glfwWindowHint(GLFW_SAMPLES, 1);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+            glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
+
+            GLFWwindow* window = glfwCreateWindow(width, height, "LearnOpenGL", NULL, NULL);
+            if (window == NULL) {
+                std::cout << "Failed to create GLFW window" << std::endl;
+                glfwTerminate();
+                return -1;
+            }
+            glfwMakeContextCurrent(window);
+            // glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+            if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
+                std::cout << "Failed to initialize GLAD" << std::endl;
+                return -1;
+            }
+
+            int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+            glCompileShader(vertexShader);
+            int success;
+            char infoLog[512];
+            glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+            if (!success) {
+                glGetShaderInfoLog(vertexShader, 512, NULL, infoLog);
+                std::cout << "ERROR::SHADER::VERTEX::COMPILATION_FAILED\n" << infoLog << std::endl;
+            }
+
+            int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
+            glCompileShader(fragmentShader);
+            glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+            if (!success) {
+                glGetShaderInfoLog(fragmentShader, 512, NULL, infoLog);
+                std::cout << "ERROR::SHADER::FRAGMENT::COMPILATION_FAILED\n" << infoLog << std::endl;
+            }
+
+            int shaderProgram = glCreateProgram();
+            glAttachShader(shaderProgram, vertexShader);
+            glAttachShader(shaderProgram, fragmentShader);
+            glLinkProgram(shaderProgram);
+            glGetProgramiv(shaderProgram, GL_LINK_STATUS, &success);
+            if (!success) {
+                glGetProgramInfoLog(shaderProgram, 512, NULL, infoLog);
+                std::cout << "ERROR::SHADER::PROGRAM::LINKING_FAILED\n" << infoLog << std::endl;
+            }
+
+            glDeleteShader(vertexShader);
+            glDeleteShader(fragmentShader);
+
+            unsigned int vbo_vertices, vbo_data, vertex_array;
+            glGenVertexArrays(1, &vertex_array);
+            glGenBuffers(1, &vbo_vertices);
+            glGenBuffers(1, &vbo_data);
+            glBindVertexArray(vertex_array);
+
+            const auto clat_bnds = infile.getVar("clat_bnds");
+            const auto clon_bnds = infile.getVar("clon_bnds");
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_vertices);
+            glBufferData(GL_ARRAY_BUFFER, 6 * sizeof(float) * ncells, nullptr, GL_STATIC_DRAW);
+            void* vertices = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+            clat_bnds.getVar({0, 0}, {ncells, 3}, {1, 1}, {6, 2}, reinterpret_cast<float*>(vertices));
+            clon_bnds.getVar({0, 0}, {ncells, 3}, {1, 1}, {6, 2}, reinterpret_cast<float*>(vertices) + 1);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), 0);
+            glEnableVertexAttribArray(0);
+
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_data);
+            glBufferData(GL_ARRAY_BUFFER, 3 * sizeof(float) * ncells, &data[0], GL_DYNAMIC_DRAW);
+            glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, sizeof(float), 0);
+            glEnableVertexAttribArray(1);
+
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindVertexArray(0);
+
+            glBindVertexArray(vertex_array);
+            glUseProgram(shaderProgram);
+            glUniform2f(glGetUniformLocation(shaderProgram, "minmax"), minmax.min, minmax.max);
+
+            float turbo_srgb_floats[256 * 3];
+#pragma omp parallel for
+            for (int i = 0; i < 256; ++i) {
+                turbo_srgb_floats[3 * i + 0] = turbo_srgb_bytes[i][0] / 255.;
+                turbo_srgb_floats[3 * i + 1] = turbo_srgb_bytes[i][1] / 255.;
+                turbo_srgb_floats[3 * i + 2] = turbo_srgb_bytes[i][2] / 255.;
+            }
+            glUniform3fv(glGetUniformLocation(shaderProgram, "cmap"), 256, turbo_srgb_floats);
+
+            const auto loc_transf = glGetUniformLocation(shaderProgram, "transf");
+            // glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_MULTISAMPLE);
+
+            float xoffset = 0.0;
+            float yoffset = 0.0;
+            float xcuroffset = 0.0;
+            float ycuroffset = 0.0;
+            auto transf = glm::mat4(1.0f);
+            glUniformMatrix4fv(loc_transf, 1, GL_FALSE, glm::value_ptr(transf));
+            double xpos = -1.0;
+            double ypos = -1.0;
+            unsigned long t = 0;
+            while (!glfwWindowShouldClose(window)) {
+                if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
+                    glfwSetWindowShouldClose(window, true);
+                }
+
+                if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+                    double xcurpos, ycurpos;
+                    glfwGetCursorPos(window, &xcurpos, &ycurpos);
+                    if (xpos < 0.0) {
+                        xpos = xcurpos;
+                        ypos = ycurpos;
+                    }
+                    xcuroffset = (xpos - xcurpos) / 200;
+                    ycuroffset = (ypos - ycurpos) / 200;
+                    transf = glm::mat4(1.0f);
+                    transf = glm::rotate(transf, yoffset + ycuroffset, glm::vec3(1.0f, 0.0f, 0.0f));
+                    transf = glm::rotate(transf, xoffset + xcuroffset, glm::vec3(0.0f, 1.0f, 0.0f));
+                    glUniformMatrix4fv(loc_transf, 1, GL_FALSE, glm::value_ptr(transf));
+                } else {
+                    xoffset += xcuroffset;
+                    yoffset += ycuroffset;
+                    xcuroffset = 0;
+                    ycuroffset = 0;
+                    xpos = -1.0;
+                    ypos = -1.0;
+                }
+
+                glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+                /*
+                const auto new_t = static_cast<unsigned long>(glfwGetTime() * 5) % ntime;
+                if (new_t != t) {
+                    std::cout << new_t << " " << t << std::endl;
+                    glBindBuffer(GL_ARRAY_BUFFER, vbo_data);
+                    void* d = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+                    // var.getVar({t, 0, 0}, {1, 1, ncells}, {1, 1, 1}, {1, 1, 3}, reinterpret_cast<float*>(d) + 2);
+                    memcpy(d, &data[t * 3 * ncells], 3 * sizeof(float) * ncells);
+                    glUnmapBuffer(GL_ARRAY_BUFFER);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    t = new_t;
+                }
+                */
+
+                glDrawArrays(GL_TRIANGLES, 0, 3 * ncells);
+
+                glfwSwapBuffers(window);
+                glfwPollEvents();
+            }
+
+            glDeleteVertexArrays(1, &vertex_array);
+            glDeleteBuffers(1, &vbo_vertices);
+            glDeleteBuffers(1, &vbo_data);
+
+            glfwTerminate();
+
+            return 0;
         });
 
         args::GlobalOptions globals(p, arguments);

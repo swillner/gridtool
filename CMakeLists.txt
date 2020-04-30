@@ -25,7 +25,7 @@ set_default_build_type(Release)
 
 project(gridtool)
 
-file(GLOB SOURCES src/*.cpp)
+file(GLOB SOURCES src/*.cpp src/*.c)
 add_executable(gridtool ${SOURCES})
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -37,7 +37,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   )
 endif()
 
-target_include_directories(gridtool PRIVATE include lib/args lib/cpp-library lib/nvector)
+target_include_directories(gridtool PRIVATE include lib/args lib/cpp-library lib/glm lib/nvector)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Intel"
 )# icc 19 does not yet fully support c++17, but we only need features it does support
   target_compile_options(gridtool PUBLIC -std=c++17)
@@ -81,6 +81,11 @@ if(WITH_GDAL)
 endif()
 
 include_netcdf_cxx4(gridtool ON v4.3.0)
+
+find_package(glfw3 3.3 REQUIRED)
+target_link_libraries(gridtool PRIVATE glfw)
+find_package(OpenGL REQUIRED)
+target_link_libraries(gridtool PRIVATE OpenGL::GL)
 
 find_path(CIMG_INCLUDE_DIR NAMES "CImg.h")
 mark_as_advanced(CIMG_INCLUDE_DIR)
