@@ -18,6 +18,10 @@
 */
 
 #include <CImg.h>
+
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
 // clang-format off
 #include <glad/glad.h> // needs to come before glfw
 #include <GLFW/glfw3.h>
@@ -555,8 +559,8 @@ void main() {
                 throw args::Error("Filename required");
             }
 
-            const auto width = width_p.Get();
-            const auto height = height_p.Get();
+            int width = width_p.Get();
+            int height = height_p.Get();
             const auto time = time_p.Get();
             const auto varname = varname_p.Get();
 
@@ -565,7 +569,7 @@ void main() {
 
             const auto var = infile.getVar(varname);
             const auto ncells = infile.getDim("ncells").getSize();
-            const auto ntime = infile.getDim("time").getSize();
+            const auto ntime = 1;  // infile.getDim("time").getSize();
 
             float fill_value = std::numeric_limits<float>::quiet_NaN();
             {
@@ -579,7 +583,7 @@ void main() {
             }
 
             std::vector<float> data(3 * ncells * ntime, 0);
-            //var.getVar({0, 0, 0}, {ntime, 1, ncells}, {1, 1, 1}, {3 * ncells, 3, 3}, &data[2]);
+            // var.getVar({0, 0, 0}, {ntime, 1, ncells}, {1, 1, 1}, {3 * ncells, 3, 3}, &data[2]);
 
             auto dmin = std::numeric_limits<float>::max();
             auto dmax = std::numeric_limits<float>::lowest();
@@ -611,22 +615,27 @@ void main() {
             std::cout << "Min: " << minmax.min << std::endl;
             std::cout << "Max: " << minmax.max << std::endl;
 
+            // TODO glfwSetErrorCallback(glfw_error_callback);
             glfwInit();
 
+            const char* glsl_version = "#version 150";
             glfwWindowHint(GLFW_SAMPLES, 1);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
             glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
             glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-            glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
+            //glfwWindowHint(GLFW_RESIZABLE, GL_FALSE);
 
-            GLFWwindow* window = glfwCreateWindow(width, height, "LearnOpenGL", NULL, NULL);
+            GLFWwindow* window = glfwCreateWindow(width, height, "gridtool", NULL, NULL);
             if (window == NULL) {
                 std::cout << "Failed to create GLFW window" << std::endl;
                 glfwTerminate();
                 return -1;
             }
+            const int sidebar_width = 100;
+            glfwSetWindowSizeLimits(window, 2 * sidebar_width, sidebar_width, GLFW_DONT_CARE, GLFW_DONT_CARE);
             glfwMakeContextCurrent(window);
+            // TODO glfwSwapInterval(1);
             // glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
 
             if (!gladLoadGLLoader(reinterpret_cast<GLADloadproc>(glfwGetProcAddress))) {
@@ -715,36 +724,88 @@ void main() {
             float yoffset = 0.0;
             float xcuroffset = 0.0;
             float ycuroffset = 0.0;
-            auto transf = glm::mat4(1.0f);
+            auto transf = glm::ortho(-1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f);
             glUniformMatrix4fv(loc_transf, 1, GL_FALSE, glm::value_ptr(transf));
             double xpos = -1.0;
             double ypos = -1.0;
             unsigned long t = 0;
+
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            (void)io;
+            // io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
+            // io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+
+            // Setup Dear ImGui style
+            ImGui::StyleColorsDark();
+            // ImGui::StyleColorsClassic();
+
+            // Setup Platform/Renderer bindings
+            ImGui_ImplGlfw_InitForOpenGL(window, true);
+            ImGui_ImplOpenGL3_Init(glsl_version);
+
+            auto& style = ImGui::GetStyle();
+            style.WindowRounding = 0;
+            style.WindowBorderSize = 0;
+            // style.Colors[ImGuiCol_WindowBg] = {0.2f, 0.2f, 0.5f, 1.0f};
+
+
+                    glBindBuffer(GL_ARRAY_BUFFER, vbo_data);
+                    void* d = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+                    var.getVar({time, 0, 0}, {1, 1, ncells}, {1, 1, 1}, {1, 1, 3}, reinterpret_cast<float*>(d) + 2);
+                    memcpy(d, &data[t * 3 * ncells], 3 * sizeof(float) * ncells);
+                    glUnmapBuffer(GL_ARRAY_BUFFER);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+
+
             while (!glfwWindowShouldClose(window)) {
+                glfwPollEvents();
+
+                glfwGetWindowSize(window, &width, &height);
+
+                ImGui_ImplOpenGL3_NewFrame();
+                ImGui_ImplGlfw_NewFrame();
+                ImGui::NewFrame();
+
+                ImGui::SetNextWindowBgAlpha(1.0f);
+                ImGui::SetNextWindowPos({0, 0});
+                ImGui::SetNextWindowSize({sidebar_width, static_cast<float>(height)});
+                ImGui::Begin("Another Window", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+                ImGui::Text("Hello from another window!");
+                ImGui::Button("Close Me");
+                ImGui::End();
+
+                ImGui::Render();
+
                 if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) {
                     glfwSetWindowShouldClose(window, true);
                 }
 
-                if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
-                    double xcurpos, ycurpos;
-                    glfwGetCursorPos(window, &xcurpos, &ycurpos);
-                    if (xpos < 0.0) {
-                        xpos = xcurpos;
-                        ypos = ycurpos;
+                if (!io.WantCaptureMouse) {
+                    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS) {
+                        double xcurpos, ycurpos;
+                        glfwGetCursorPos(window, &xcurpos, &ycurpos);
+                        if (xpos < 0.0) {
+                            xpos = xcurpos;
+                            ypos = ycurpos;
+                        }
+                        xcuroffset = (xpos - xcurpos) / 200;
+                        ycuroffset = (ypos - ycurpos) / 200;
+                        transf = glm::ortho(-1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f);
+                        //transf = glm::translate(transf, glm::vec3(0.5f, 0.0f, 0.0f));
+                        transf = glm::rotate(transf, yoffset + ycuroffset, glm::vec3(1.0f, 0.0f, 0.0f));
+                        transf = glm::rotate(transf, xoffset + xcuroffset, glm::vec3(0.0f, 1.0f, 0.0f));
+                        glUniformMatrix4fv(loc_transf, 1, GL_FALSE, glm::value_ptr(transf));
+                    } else {
+                        xoffset += xcuroffset;
+                        yoffset += ycuroffset;
+                        xcuroffset = 0;
+                        ycuroffset = 0;
+                        xpos = -1.0;
+                        ypos = -1.0;
                     }
-                    xcuroffset = (xpos - xcurpos) / 200;
-                    ycuroffset = (ypos - ycurpos) / 200;
-                    transf = glm::mat4(1.0f);
-                    transf = glm::rotate(transf, yoffset + ycuroffset, glm::vec3(1.0f, 0.0f, 0.0f));
-                    transf = glm::rotate(transf, xoffset + xcuroffset, glm::vec3(0.0f, 1.0f, 0.0f));
-                    glUniformMatrix4fv(loc_transf, 1, GL_FALSE, glm::value_ptr(transf));
-                } else {
-                    xoffset += xcuroffset;
-                    yoffset += ycuroffset;
-                    xcuroffset = 0;
-                    ycuroffset = 0;
-                    xpos = -1.0;
-                    ypos = -1.0;
                 }
 
                 glClearColor(0.05f, 0.05f, 0.06f, 1.0f);
@@ -766,14 +827,20 @@ void main() {
 
                 glDrawArrays(GL_TRIANGLES, 0, 3 * ncells);
 
+                ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
                 glfwSwapBuffers(window);
-                glfwPollEvents();
             }
 
             glDeleteVertexArrays(1, &vertex_array);
             glDeleteBuffers(1, &vbo_vertices);
             glDeleteBuffers(1, &vbo_data);
 
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+
+            glfwDestroyWindow(window);
             glfwTerminate();
 
             return 0;

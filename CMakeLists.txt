@@ -26,7 +26,14 @@ set_default_build_type(Release)
 project(gridtool)
 
 file(GLOB SOURCES src/*.cpp src/*.c)
-add_executable(gridtool ${SOURCES})
+add_executable(gridtool
+  ${SOURCES}
+  lib/imgui/imgui.cpp
+  lib/imgui/imgui_draw.cpp
+  lib/imgui/imgui_widgets.cpp
+  lib/imgui/examples/imgui_impl_opengl3.cpp
+  lib/imgui/examples/imgui_impl_glfw.cpp
+  )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(gridtool PUBLIC -fno-math-errno -fno-rtti)
@@ -37,7 +44,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   )
 endif()
 
-target_include_directories(gridtool PRIVATE include lib/args lib/cpp-library lib/glm lib/nvector)
+target_include_directories(gridtool PRIVATE include lib/args lib/cpp-library lib/glm lib/imgui lib/imgui/examples lib/nvector)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Intel"
 )# icc 19 does not yet fully support c++17, but we only need features it does support
   target_compile_options(gridtool PUBLIC -std=c++17)
